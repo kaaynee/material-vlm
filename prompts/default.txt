@@ -1,0 +1,3 @@
+Identify every distinct material visible in the image(s) and assess the condition of each one.
+Note visible defects such as cracks, corrosion, stains, wear, moisture damage, or deformation.
+Only report what you can actually see; if something is unclear, lower the confidence instead of guessing.

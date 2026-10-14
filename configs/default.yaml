@@ -1,0 +1,16 @@
+# Any Hugging Face model that works with AutoModelForImageTextToText.
+model_id: Qwen/Qwen2.5-VL-7B-Instruct
+
+# Task prompt sent together with the images.
+prompt_file: prompts/default.txt
+
+# false: one analysis per image. true: all images go into a single request
+# (e.g. several views of the same object).
+joint: false
+
+# Images are downscaled so their longest side is at most this many pixels.
+max_image_side: 1280
+
+max_new_tokens: 1024
+# 0 means greedy decoding (deterministic).
+temperature: 0.0
