@@ -5,6 +5,11 @@ set -euo pipefail
 
 source scripts/euler/env.sh
 
+if ! python -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
+    echo "Python >= 3.10 required, got $(python --version 2>&1). Set EULER_MODULES (see scripts/euler/env.sh)." >&2
+    exit 1
+fi
+
 python -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip

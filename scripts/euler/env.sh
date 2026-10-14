@@ -1,7 +1,10 @@
 # Shared environment for Euler. Source this file, do not execute it.
-# Check available versions with `module spider python` if a module is missing.
-
-module load stack/2024.06 gcc/12.2.0 python/3.11.6 eth_proxy
+#
+# Unversioned names load Euler's current defaults. To pin versions, check
+# `module avail stack` and `module spider python`, then e.g.:
+#   export EULER_MODULES="stack/<version> gcc/<version> python/<version> eth_proxy"
+EULER_MODULES="${EULER_MODULES:-stack gcc python eth_proxy}"
+module load $EULER_MODULES || return 1
 
 # Virtual environment location (several GB once torch is installed).
 export VENV_DIR="${VENV_DIR:-$PWD/.venv}"
