@@ -16,6 +16,7 @@ prompts/default.txt       default task prompt
 src/material_vlm/
   cli.py                  command line entry point
   pipeline.py             image loading, prompt + images -> analysis
+  frames.py               frame extraction from videos
   model.py                Hugging Face VLM wrapper
   schema.py               output schema, system prompt, JSON parsing
 scripts/euler/
@@ -39,6 +40,19 @@ repository and installs the package. The Hugging Face cache is placed in
 script to change the locations.
 
 ## Running
+
+### Images from a video
+
+Extract one frame per second (the sharpest frame of each second is kept):
+
+```bash
+material-vlm-frames data/videos/site.mp4 --out data/frames/site --every 1.0
+```
+
+`--max-frames` limits the count and `--no-sharpest` keeps the first frame of
+each interval instead. This runs on CPU, so a login node or your laptop is fine.
+
+### Analysis
 
 Put images in `data/` (ignored by git) and submit from the repository root:
 

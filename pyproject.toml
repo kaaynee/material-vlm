@@ -14,6 +14,7 @@ dependencies = [
     "transformers>=4.49",
     "accelerate",
     "pillow",
+    "opencv-python-headless",
     "pydantic>=2",
     "pyyaml",
 ]
@@ -23,6 +24,7 @@ dev = ["pytest"]
 
 [project.scripts]
 material-vlm = "material_vlm.cli:main"
+material-vlm-frames = "material_vlm.frames:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
