@@ -15,7 +15,7 @@ class VLM:
         self.model_id = model_id
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = AutoModelForImageTextToText.from_pretrained(
-            model_id, torch_dtype="auto", device_map="auto"
+            model_id, dtype="auto", device_map="auto"
         )
         self.model.eval()
 
@@ -24,9 +24,11 @@ class VLM:
         images: list[Image.Image],
         prompt: str,
         system_prompt: str | None = None,
-        max_new_tokens: int = 1024,
+        max_new_tokens: int = 2048,
         temperature: float = 0.0,
-    ) -> str:
+    ) -> tuple[str, list[tuple[int, int]]]:
+        """Return the generated text and the (width, height) of each image as the
+        model saw it, which is the coordinate frame of any boxes it outputs."""
         messages = []
         if system_prompt:
             messages.append(
@@ -52,4 +54,14 @@ class VLM:
                 **inputs, max_new_tokens=max_new_tokens, **sampling
             )
         new_tokens = output_ids[:, inputs["input_ids"].shape[1] :]
-        return self.processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
+        text = self.processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
+        return text, self._input_sizes(inputs, images)
+
+    def _input_sizes(self, inputs, images) -> list[tuple[int, int]]:
+        # Qwen-style processors resize images to a grid of patches; boxes refer
+        # to that resized image, not to the image we passed in.
+        grid = inputs.get("image_grid_thw")
+        patch = getattr(self.processor.image_processor, "patch_size", None)
+        if grid is None or patch is None:
+            return [image.size for image in images]
+        return [(int(w) * patch, int(h) * patch) for _, h, w in grid.tolist()]

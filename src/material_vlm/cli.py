@@ -16,8 +16,11 @@ DEFAULTS = {
     "prompt_file": None,
     "joint": False,
     "max_image_side": 1280,
-    "max_new_tokens": 1024,
+    "max_new_tokens": 2048,
     "temperature": 0.0,
+    "box_coords": "input_pixels",
+    "segment": True,
+    "segmenter_id": "facebook/sam2.1-hiera-large",
 }
 
 
@@ -29,7 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--images", nargs="+", required=True, help="image files and/or directories"
     )
-    parser.add_argument("--output", default=None, help="JSON output file (default: stdout)")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="JSON output file (default: stdout). Masks and overlays are written to a "
+        "directory of the same name without the extension.",
+    )
     parser.add_argument("--config", default=None, help="YAML config file")
     prompt = parser.add_mutually_exclusive_group()
     prompt.add_argument("--prompt", default=None, help="task prompt text")
@@ -44,6 +52,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-image-side", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument(
+        "--box-coords",
+        choices=["input_pixels", "normalized_1000"],
+        default=None,
+        help="box format the VLM uses: input_pixels for Qwen2.5-VL, normalized_1000 "
+        "for Qwen3-VL",
+    )
+    parser.add_argument(
+        "--segment",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="turn detected boxes into masks with SAM 2",
+    )
+    parser.add_argument("--segmenter-id", default=None)
     return parser
 
 
@@ -76,11 +98,20 @@ def main(argv: list[str] | None = None) -> int:
     config = resolve_config(args)
     prompt = resolve_prompt(args, config)
     image_paths = collect_images(args.images)
+    artifacts_dir = Path(args.output).with_suffix("") if args.output else None
+    segment = config["segment"] and not config["joint"]
+    if segment and artifacts_dir is None:
+        raise ValueError("segmentation writes mask files: pass --output or use --no-segment")
     print(f"Analyzing {len(image_paths)} image(s) with {config['model_id']}", file=sys.stderr)
 
     from .model import VLM
 
     vlm = VLM(config["model_id"])
+    segmenter = None
+    if segment:
+        from .segmentation import Segmenter
+
+        segmenter = Segmenter(config["segmenter_id"])
     results = analyze(
         vlm,
         image_paths,
@@ -89,6 +120,9 @@ def main(argv: list[str] | None = None) -> int:
         max_image_side=config["max_image_side"],
         max_new_tokens=config["max_new_tokens"],
         temperature=config["temperature"],
+        box_coords=config["box_coords"],
+        segmenter=segmenter,
+        artifacts_dir=artifacts_dir,
     )
 
     payload = json.dumps(
@@ -101,6 +135,8 @@ def main(argv: list[str] | None = None) -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(payload + "\n")
         print(f"Wrote {output}", file=sys.stderr)
+        if artifacts_dir.exists():
+            print(f"Wrote masks and overlays to {artifacts_dir}", file=sys.stderr)
     else:
         print(payload)
 

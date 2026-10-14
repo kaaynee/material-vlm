@@ -11,6 +11,13 @@ joint: false
 # Images are downscaled so their longest side is at most this many pixels.
 max_image_side: 1280
 
-max_new_tokens: 1024
+max_new_tokens: 2048
 # 0 means greedy decoding (deterministic).
 temperature: 0.0
+
+# Box format of the VLM: input_pixels (Qwen2.5-VL) or normalized_1000 (Qwen3-VL).
+box_coords: input_pixels
+
+# Turn the VLM's boxes into pixel masks with SAM 2 (per-image mode only).
+segment: true
+segmenter_id: facebook/sam2.1-hiera-large

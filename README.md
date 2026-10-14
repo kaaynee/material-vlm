@@ -6,7 +6,9 @@ condition they are in.
 
 The model runs locally through Hugging Face `transformers`
 (default: `Qwen/Qwen2.5-VL-7B-Instruct`), so it can run on an Euler GPU node
-without any external API.
+without any external API. Per image it produces a JSON analysis, pixel masks
+for every material and defect (via SAM 2) and overlay images showing where
+everything was detected.
 
 ## Layout
 
@@ -19,6 +21,8 @@ src/material_vlm/
   frames.py               frame extraction from videos
   model.py                Hugging Face VLM wrapper
   schema.py               output schema, system prompt, JSON parsing
+  segmentation.py         SAM 2 masks from boxes, box coordinate conversion
+  visualize.py            overlay images
 scripts/euler/
   env.sh                  modules, venv location, HF cache location
   setup_env.sh            one-time environment setup
@@ -94,8 +98,24 @@ material-vlm --config configs/default.yaml --images data/images/example.jpg
 | `--model-id` | any model supported by `AutoModelForImageTextToText` |
 | `--joint` / `--no-joint` | one request for all images / one request per image |
 | `--max-image-side`, `--max-new-tokens`, `--temperature` | generation settings |
+| `--segment` / `--no-segment` | masks with SAM 2 / boxes only |
+| `--segmenter-id` | SAM 2 checkpoint (default `facebook/sam2.1-hiera-large`) |
+| `--box-coords` | `input_pixels` (Qwen2.5-VL) or `normalized_1000` (Qwen3-VL) |
 
 ## Output
+
+For `--output outputs/run.json` the pipeline writes:
+
+```
+outputs/run.json                         analysis of all images
+outputs/run/overlays/0000_wall_materials.jpg   materials, colored per material, labeled with condition
+outputs/run/overlays/0000_wall_defects.jpg     defects, colored by type
+outputs/run/masks/0000_wall/material_00_clay-brick.png
+outputs/run/masks/0000_wall/defect_00_00_crack.png
+```
+
+Masks are binary PNGs (0/255) at the original image resolution. The JSON
+looks like this (one entry in `results` per image):
 
 ```json
 {
@@ -105,18 +125,35 @@ material-vlm --config configs/default.yaml --images data/images/example.jpg
     {
       "images": ["data/images/wall.jpg"],
       "analysis": {
-        "summary": "A weathered brick wall with a steel door.",
+        "summary": "A brick wall next to a steel plate.",
         "materials": [
           {
             "name": "clay brick",
             "category": "masonry",
-            "location": "wall",
+            "boxes": [[40.0, 60.0, 700.0, 740.0]],
             "confidence": 0.9,
             "condition": "fair",
-            "defects": ["efflorescence"],
-            "evidence": "red rectangular units with mortar joints"
+            "evidence": "red rectangular units with mortar joints",
+            "defects": [
+              {
+                "type": "crack",
+                "severity": "medium",
+                "description": "diagonal crack through several bricks",
+                "boxes": [[190.0, 110.0, 270.0, 460.0]],
+                "mask": "outputs/run/masks/0000_wall/defect_00_00_crack.png",
+                "mask_score": 0.84,
+                "area_fraction": 0.0035
+              }
+            ],
+            "mask": "outputs/run/masks/0000_wall/material_00_clay-brick.png",
+            "mask_score": 0.97,
+            "area_fraction": 0.3723
           }
         ]
+      },
+      "overlays": {
+        "materials": "outputs/run/overlays/0000_wall_materials.jpg",
+        "defects": "outputs/run/overlays/0000_wall_defects.jpg"
       },
       "parse_error": null,
       "raw_output": "..."
@@ -125,12 +162,34 @@ material-vlm --config configs/default.yaml --images data/images/example.jpg
 }
 ```
 
-`condition` is one of `good`, `fair`, `poor`, `unknown`. If the model output
-cannot be parsed, `analysis` is `null`, `parse_error` explains why and
-`raw_output` still holds the model's text.
+- `condition`: `good`, `fair`, `poor` or `unknown`.
+- Defect `type`: `crack`, `corrosion`, `biological_decay` (mold, moss, algae,
+  lichen, fungi, rot) or `other`; `severity`: `low`, `medium`, `high` or `unknown`.
+- `boxes`: `[x1, y1, x2, y2]` in pixels of the original image.
+- `mask_score`: SAM 2's predicted mask quality (0-1); `area_fraction`: share
+  of the image covered by the mask.
 
-The output structure is defined in `src/material_vlm/schema.py` (the
-`SYSTEM_PROMPT` and the pydantic models); change both together to add fields.
+If the model output cannot be parsed, `analysis` is `null`, `parse_error`
+explains why and `raw_output` still holds the model's text.
+
+### How localization works
+
+The VLM outputs a bounding box per material region and per defect area
+(Qwen2.5-VL is trained for this kind of grounding). The boxes are converted
+from the model's internal image size to the original image and passed to
+SAM 2 as prompts, which returns a pixel mask per box. Masks of the same
+material or defect are merged.
+
+- Box accuracy is the limiting factor: SAM 2 segments whatever is most
+  prominent in the box, so a loose box around a crack can yield a mask of the
+  surrounding surface. Check `mask_score` and the overlays.
+- Boxes and masks are only produced per image. With `--joint` they are left
+  empty, since they cannot be attributed to a single image.
+- `--no-segment` skips SAM 2 and draws boxes only. For a VLM that uses 0-1000
+  normalized coordinates (e.g. Qwen3-VL), set `--box-coords normalized_1000`.
+
+The output structure is defined in `src/material_vlm/schema.py` (the system
+prompt and the pydantic models); change both together to add fields.
 
 ## Tests
 
