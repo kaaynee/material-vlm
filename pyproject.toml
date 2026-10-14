@@ -22,10 +22,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+# Fast kernels for Qwen3.5's linear-attention layers (CUDA only). Without them
+# transformers falls back to a much slower PyTorch implementation.
+qwen35 = ["flash-linear-attention"]
 
 [project.scripts]
 material-vlm = "material_vlm.cli:main"
 material-vlm-frames = "material_vlm.frames:main"
+material-vlm-compare = "material_vlm.compare:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

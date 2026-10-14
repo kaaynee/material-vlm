@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 
 import numpy as np
@@ -125,6 +126,7 @@ def analyze(
     max_image_side: int | None = 1280,
     max_new_tokens: int = 2048,
     temperature: float = 0.0,
+    thinking: bool = False,
     box_coords: str = "input_pixels",
     segmenter=None,
     artifacts_dir: Path | None = None,
@@ -141,15 +143,18 @@ def analyze(
     results = []
     for index, group in enumerate(groups):
         images = [load_image(p, max_image_side) for p in group]
+        start = time.perf_counter()
         raw, input_sizes = vlm.generate(
             images,
             prompt,
             system_prompt=system_prompt,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
+            thinking=thinking,
         )
         record = {
             "images": [str(p) for p in group],
+            "vlm_seconds": round(time.perf_counter() - start, 2),
             "analysis": None,
             "overlays": {},
             "parse_error": None,

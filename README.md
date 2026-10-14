@@ -19,6 +19,7 @@ src/material_vlm/
   cli.py                  command line entry point
   pipeline.py             image loading, prompt + images -> analysis
   frames.py               frame extraction from videos
+  compare.py              side-by-side comparison of runs
   model.py                Hugging Face VLM wrapper
   schema.py               output schema, system prompt, JSON parsing
   segmentation.py         SAM 2 masks from boxes, box coordinate conversion
@@ -27,6 +28,8 @@ scripts/euler/
   env.sh                  modules, venv location, HF cache location
   setup_env.sh            one-time environment setup
   analyze.sbatch          Slurm job
+  compare.sh              one job per model in configs/models/
+  download.sbatch         fetch model weights on a CPU node
 tests/                    tests that run without a GPU or model download
 ```
 
@@ -87,6 +90,48 @@ source scripts/euler/env.sh && source "$VENV_DIR/bin/activate"
 material-vlm --config configs/default.yaml --images data/images/example.jpg
 ```
 
+### Comparing models
+
+Per-model settings live in `configs/models/` and are layered on top of
+`configs/default.yaml` with a second `--config`. `scripts/euler/compare.sh`
+submits one job per model, requesting the GPUs each one needs:
+
+| Set | Config | Parameters | GPUs |
+| --- | --- | --- | --- |
+| `small` | `qwen2.5-vl-7b` | 8B | 1 x 24 GB |
+| | `qwen3-vl-8b` | 9B | 1 x 24 GB |
+| | `qwen3.5-9b` | 10B | 1 x 32 GB |
+| `large` | `qwen2.5-vl-72b` | 73B | 2 x 80 GB |
+| | `qwen3-vl-32b` | 33B | 1 x 80 GB |
+| | `qwen3.5-27b` | 28B | 1 x 80 GB |
+| `moe` | `qwen3-vl-30b-a3b` | 31B (3B active) | 1 x 80 GB |
+| | `qwen3.5-35b-a3b` | 36B (3B active) | 2 x 80 GB |
+| | `qwen3.5-122b-a10b` | 125B (10B active) | 4 x 80 GB |
+
+Qwen2.5-VL boxes are in pixels of the resized model input; Qwen3-VL and
+Qwen3.5 use 0-1000 normalized coordinates. The configs set this.
+
+Download the weights first on a CPU node (the large set is about 300 GB in
+`$SCRATCH/hf_cache`), then submit and compare:
+
+```bash
+sbatch scripts/euler/download.sbatch qwen2.5-vl-72b qwen3-vl-32b qwen3.5-27b
+bash scripts/euler/compare.sh data/frames/site site large
+material-vlm-compare outputs/site/*.json --out outputs/site/comparison
+```
+
+`compare.sh` also takes a quoted list of configs instead of a set name, and
+passes any further arguments to `material-vlm`. The comparison writes one
+side-by-side image per input image and a `summary.json` with parse rate,
+materials per image, defect counts, mean mask score and seconds per image.
+
+If you set up the environment before Qwen3.5 support was added, run
+`pip install -e ".[dev,qwen35]"` for its fast kernels.
+
+Qwen3.5 reasons in a `<think>` block by default. This is turned off in its
+configs so the models are compared on equal terms; `--thinking --max-new-tokens 8192`
+turns it on (much slower, may improve condition assessment).
+
 ### Options
 
 | Option | Meaning |
@@ -100,7 +145,9 @@ material-vlm --config configs/default.yaml --images data/images/example.jpg
 | `--max-image-side`, `--max-new-tokens`, `--temperature` | generation settings |
 | `--segment` / `--no-segment` | masks with SAM 2 / boxes only |
 | `--segmenter-id` | SAM 2 checkpoint (default `facebook/sam2.1-hiera-large`) |
-| `--box-coords` | `input_pixels` (Qwen2.5-VL) or `normalized_1000` (Qwen3-VL) |
+| `--box-coords` | `input_pixels` (Qwen2.5-VL) or `normalized_1000` (Qwen3-VL, Qwen3.5) |
+| `--thinking` / `--no-thinking` | Qwen3/3.5 reasoning before the answer |
+| `--config` | repeatable; later files override earlier ones |
 
 ## Output
 

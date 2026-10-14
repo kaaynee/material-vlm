@@ -1,0 +1,5 @@
+# Layer on top of configs/default.yaml: --config configs/models/qwen3.5-35b-a3b.yaml
+# GPU requirements are set in scripts/euler/compare.sh.
+model_id: Qwen/Qwen3.5-35B-A3B
+box_coords: normalized_1000
+thinking: false

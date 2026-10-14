@@ -13,7 +13,10 @@ fi
 python -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
-pip install -e ".[dev]"
+pip install -e ".[dev,qwen35]"
+# Optional, compiled against CUDA: the remaining Qwen3.5 kernel. Failure is fine.
+pip install causal-conv1d --no-build-isolation \
+    || echo "causal-conv1d not installed; Qwen3.5 still works, slightly slower"
 
 mkdir -p "$HF_HOME" logs outputs
 echo "Environment ready in $VENV_DIR (HF cache: $HF_HOME)"

@@ -26,6 +26,7 @@ class VLM:
         system_prompt: str | None = None,
         max_new_tokens: int = 2048,
         temperature: float = 0.0,
+        thinking: bool = False,
     ) -> tuple[str, list[tuple[int, int]]]:
         """Return the generated text and the (width, height) of each image as the
         model saw it, which is the coordinate frame of any boxes it outputs."""
@@ -38,8 +39,9 @@ class VLM:
         content.append({"type": "text", "text": prompt})
         messages.append({"role": "user", "content": content})
 
+        # enable_thinking is read by Qwen3/3.5 chat templates and ignored by others.
         text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking
         )
         inputs = self.processor(text=[text], images=images, return_tensors="pt")
         inputs = inputs.to(self.model.device)

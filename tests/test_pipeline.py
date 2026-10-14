@@ -69,6 +69,13 @@ def test_extract_json_from_fenced_output():
     assert extract_json(text) == ANSWER
 
 
+def test_extract_json_skips_thinking():
+    text = 'Sure.<think>maybe {"summary": "draft"} is right</think>\n{"summary": "final"}'
+    assert extract_json(text) == {"summary": "final"}
+    with pytest.raises(ValueError):
+        extract_json('<think>ran out of tokens while thinking about {"a": 1}')
+
+
 def test_extract_json_without_object():
     with pytest.raises(ValueError):
         extract_json("I cannot see any image.")
@@ -157,13 +164,36 @@ def test_analyze_keeps_raw_output_on_parse_failure(image_dir):
 def test_cli_overrides_config(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("model_id: some/model\njoint: true\nmax_new_tokens: 256\n")
+    model = tmp_path / "model.yaml"
+    model.write_text("model_id: other/model\nthinking: true\n")
     args = build_parser().parse_args(
-        ["--images", "x", "--config", str(config), "--no-joint", "--temperature", "0.5",
-         "--no-segment"]
+        ["--images", "x", "--config", str(config), "--config", str(model), "--no-joint",
+         "--temperature", "0.5", "--no-segment"]
     )
     resolved = resolve_config(args)
-    assert resolved["model_id"] == "some/model"
+    assert resolved["model_id"] == "other/model"
+    assert resolved["thinking"] is True
     assert resolved["joint"] is False
     assert resolved["max_new_tokens"] == 256
     assert resolved["temperature"] == 0.5
     assert resolved["segment"] is False
+
+
+def test_compare_runs(image_dir, tmp_path):
+    from material_vlm.compare import main as compare_main
+
+    paths = collect_images([image_dir])
+    for name, answer in [("model-a", json.dumps(ANSWER)), ("model-b", "no json")]:
+        results = analyze(FakeVLM(answer), paths, "prompt", segmenter=FakeSegmenter(),
+                          artifacts_dir=tmp_path / name)
+        (tmp_path / f"{name}.json").write_text(
+            json.dumps({"model_id": name, "prompt": "prompt", "results": results})
+        )
+    out = tmp_path / "comparison"
+    compare_main([str(tmp_path / "model-a.json"), str(tmp_path / "model-b.json"), "--out", str(out)])
+
+    summary = json.loads((out / "summary.json").read_text())
+    assert [(s["run"], s["parsed"]) for s in summary] == [("model-a", 2), ("model-b", 0)]
+    assert summary[0]["defects"] == {"biological_decay": 2, "crack": 2}
+    grid = Image.open(out / "0000_a.jpg")
+    assert grid.width == 2 * 640

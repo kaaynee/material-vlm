@@ -1,0 +1,3 @@
+# Layer on top of configs/default.yaml: --config configs/models/qwen3-vl-8b.yaml
+model_id: Qwen/Qwen3-VL-8B-Instruct
+box_coords: normalized_1000

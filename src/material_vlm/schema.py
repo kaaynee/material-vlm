@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -158,8 +159,10 @@ def extract_json(text: str) -> dict:
     """Return the first JSON object found in the model output.
 
     Models often wrap the JSON in a markdown fence or add a sentence around it,
-    so scan for the first position that decodes to an object.
+    so scan for the first position that decodes to an object. Reasoning in
+    <think> tags (Qwen3.5 thinking mode) is skipped, including an unclosed block.
     """
+    text = re.sub(r"<think>.*?(</think>|$)", "", text, flags=re.DOTALL)
     decoder = json.JSONDecoder()
     start = text.find("{")
     while start != -1:

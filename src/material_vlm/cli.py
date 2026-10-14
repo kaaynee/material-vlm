@@ -18,6 +18,7 @@ DEFAULTS = {
     "max_image_side": 1280,
     "max_new_tokens": 2048,
     "temperature": 0.0,
+    "thinking": False,
     "box_coords": "input_pixels",
     "segment": True,
     "segmenter_id": "facebook/sam2.1-hiera-large",
@@ -38,7 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON output file (default: stdout). Masks and overlays are written to a "
         "directory of the same name without the extension.",
     )
-    parser.add_argument("--config", default=None, help="YAML config file")
+    parser.add_argument(
+        "--config",
+        action="append",
+        default=[],
+        help="YAML config file; repeat to layer files, later ones override earlier ones",
+    )
     prompt = parser.add_mutually_exclusive_group()
     prompt.add_argument("--prompt", default=None, help="task prompt text")
     prompt.add_argument("--prompt-file", default=None, help="file containing the task prompt")
@@ -52,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-image-side", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument(
+        "--thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="let Qwen3/3.5 reason before answering (slower, needs more max-new-tokens)",
+    )
     parser.add_argument(
         "--box-coords",
         choices=["input_pixels", "normalized_1000"],
@@ -70,13 +82,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_config(args: argparse.Namespace) -> dict:
-    """Merge defaults < config file < command line arguments."""
+    """Merge defaults < config files (in order) < command line arguments."""
     config = dict(DEFAULTS)
-    if args.config:
-        loaded = yaml.safe_load(Path(args.config).read_text()) or {}
+    for path in args.config:
+        loaded = yaml.safe_load(Path(path).read_text()) or {}
         unknown = set(loaded) - set(DEFAULTS)
         if unknown:
-            raise ValueError(f"unknown config keys: {sorted(unknown)}")
+            raise ValueError(f"unknown config keys in {path}: {sorted(unknown)}")
         config.update(loaded)
     for key in DEFAULTS:
         value = getattr(args, key, None)
@@ -120,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         max_image_side=config["max_image_side"],
         max_new_tokens=config["max_new_tokens"],
         temperature=config["temperature"],
+        thinking=config["thinking"],
         box_coords=config["box_coords"],
         segmenter=segmenter,
         artifacts_dir=artifacts_dir,
