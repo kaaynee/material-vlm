@@ -19,6 +19,10 @@ fi
 images=$1
 name=$2
 shift 2
+if [ ! -e "$images" ]; then
+    echo "image path does not exist: $images (relative paths are resolved from $(pwd))" >&2
+    exit 1
+fi
 set_name=small
 if [ $# -gt 0 ] && [[ $1 != -* ]]; then
     set_name=$1
