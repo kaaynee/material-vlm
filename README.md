@@ -132,6 +132,41 @@ Qwen3.5 reasons in a `<think>` block by default. This is turned off in its
 configs so the models are compared on equal terms; `--thinking --max-new-tokens 8192`
 turns it on (much slower, may improve condition assessment).
 
+### Quick wins: enhanced settings
+
+`configs/enhanced.yaml` turns on improvements that need no training. Layer it
+after the model config:
+
+```bash
+sbatch --gpus=1 --gres=gpumem:80g --time=08:00:00 scripts/euler/analyze.sbatch \
+    --config configs/models/qwen3-vl-32b.yaml --config configs/enhanced.yaml \
+    --images data/frames/site --output outputs/site_enhanced/qwen3-vl-32b.json
+
+# or for a whole model set
+bash scripts/euler/compare.sh data/frames/site site_enhanced large --config configs/enhanced.yaml
+```
+
+| Setting | Effect | Cost |
+| --- | --- | --- |
+| `prompt_file: prompts/enhanced.txt` | Defines the condition scale, each defect type and common confusions (joints vs. cracks, dirt vs. algae) | none |
+| `max_image_side: 1792` | Full-image pass at higher resolution | slower, more GPU memory |
+| `zoom_tiles: 2` | Searches 2 x 2 overlapping full-resolution crops for small defects; new ones are merged in, duplicates dropped | 5 VLM calls per image instead of 1 |
+| `defect_segmenter: sam3` | Masks for cracks, rust and biological growth from text-prompted SAM 3 instead of a box, where SAM 3 agrees with the VLM's box | ~1 s per image |
+| `sam3_discover: true` | Adds SAM 3 detections the VLM missed, if they lie on a detected material | none extra |
+
+Every defect records where it came from in `source` (`vlm`, `zoom` or `sam3`)
+and how its mask was made in `mask_source` (`sam3` or `sam2`); the defect
+overlay labels zoom and SAM 3 findings. That makes it easy to check whether
+each addition helps or only adds false positives. Time limits need to be raised
+accordingly, since the zoom pass makes each image about five times slower.
+
+SAM 3 (`facebook/sam3`) is gated. Request access on its Hugging Face page, then
+on Euler run `hf auth login` once (or set `HF_TOKEN`) before downloading.
+
+The output JSON also contains an `overview`: every material seen across the
+images, in how many images it appeared, its condition counts, worst condition
+and defect counts. This is useful for frames of a video.
+
 ### Options
 
 | Option | Meaning |
@@ -148,6 +183,9 @@ turns it on (much slower, may improve condition assessment).
 | `--box-coords` | `input_pixels` (Qwen2.5-VL) or `normalized_1000` (Qwen3-VL, Qwen3.5) |
 | `--thinking` / `--no-thinking` | Qwen3/3.5 reasoning before the answer |
 | `--config` | repeatable; later files override earlier ones |
+| `--zoom-tiles N` | also search N x N crops for defects (0 = off) |
+| `--defect-segmenter sam3` | text-prompted SAM 3 defect masks |
+| `--sam3-discover` | add SAM 3 detections the VLM missed |
 
 ## Output
 

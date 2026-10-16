@@ -1,0 +1,26 @@
+Identify every distinct material visible in the image and assess the condition of each one.
+Inspect the whole image systematically, including edges, corners and small areas, and report each
+distinct defect area separately with a tight box.
+
+Condition scale:
+- good: intact; at most superficial soiling or discoloration; no maintenance needed.
+- fair: localized, non-structural defects (hairline cracks, isolated rust spots, light biological
+  growth, minor wear); monitoring or minor maintenance needed.
+- poor: extensive or structural defects (wide, branching or through cracks, spalling, flaking rust
+  or section loss, wood rot, dense biological growth); repair needed.
+- unknown: the material is visible but its condition cannot be judged (too small, blurred, occluded).
+
+Defect types:
+- crack: thin linear fracture lines, from hairline to wide. Do not confuse with mortar or
+  construction joints, edges, scratches, cables or shadows.
+- corrosion: orange-brown rust, rust staining, flaking, pitting or section loss on metal, and rust
+  stains on concrete from corroding reinforcement.
+- biological_decay: moss, algae (green or black films), lichen, mold, fungi and wood rot. Do not
+  confuse with dirt, soot or water stains.
+- other: anything else, such as spalling, efflorescence (white salt deposits), delamination,
+  moisture damage, deformation or missing parts. Name it in the description.
+
+Severity: low = small and superficial; medium = clearly visible over a noticeable area or
+moderately deep; high = extensive, deep or structurally relevant.
+
+Only report what you can actually see; if something is unclear, lower the confidence instead of guessing.

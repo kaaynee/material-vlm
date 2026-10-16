@@ -60,3 +60,52 @@ class Segmenter:
         )[0]
         scores = outputs.iou_scores.cpu().flatten().tolist()
         return [(m[0].numpy().astype(bool), float(s)) for m, s in zip(masks, scores)]
+
+
+# Text prompts SAM 3 is queried with for each defect type. "other" has none and
+# falls back to box-prompted SAM 2.
+DEFECT_CONCEPTS = {
+    "crack": ["crack"],
+    "corrosion": ["rust"],
+    "biological_decay": ["moss", "algae", "lichen", "mold"],
+}
+
+
+class DefectSegmenter:
+    """Text-prompted instance segmentation of defects with SAM 3."""
+
+    def __init__(self, model_id: str = "facebook/sam3", threshold: float = 0.4):
+        import torch
+        from transformers import Sam3Model, Sam3Processor
+
+        self._torch = torch
+        self.threshold = threshold
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.processor = Sam3Processor.from_pretrained(model_id)
+        self.model = Sam3Model.from_pretrained(model_id).to(self.device).eval()
+
+    def detect(self, image: Image.Image, defect_type: str) -> list[dict]:
+        """Return all instances of a defect type as dicts with ``mask`` (bool
+        array at image resolution), ``box`` (pixels), ``score`` and ``concept``."""
+        detections = []
+        for concept in DEFECT_CONCEPTS.get(defect_type, []):
+            inputs = self.processor(images=image, text=concept, return_tensors="pt")
+            inputs = inputs.to(self.device)
+            with self._torch.inference_mode():
+                outputs = self.model(**inputs)
+            result = self.processor.post_process_instance_segmentation(
+                outputs,
+                threshold=self.threshold,
+                mask_threshold=0.5,
+                target_sizes=inputs["original_sizes"].tolist(),
+            )[0]
+            for mask, box, score in zip(result["masks"], result["boxes"], result["scores"]):
+                detections.append(
+                    {
+                        "mask": mask.cpu().numpy().astype(bool),
+                        "box": [round(float(v), 1) for v in box],
+                        "score": float(score),
+                        "concept": concept,
+                    }
+                )
+        return detections

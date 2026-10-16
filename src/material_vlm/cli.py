@@ -9,7 +9,7 @@ from pathlib import Path
 
 import yaml
 
-from .pipeline import analyze, collect_images
+from .pipeline import analyze, collect_images, overview
 
 DEFAULTS = {
     "model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
@@ -22,6 +22,12 @@ DEFAULTS = {
     "box_coords": "input_pixels",
     "segment": True,
     "segmenter_id": "facebook/sam2.1-hiera-large",
+    "zoom_tiles": 0,
+    "zoom_overlap": 0.15,
+    "defect_segmenter": "none",
+    "sam3_id": "facebook/sam3",
+    "sam3_threshold": 0.4,
+    "sam3_discover": False,
 }
 
 
@@ -78,6 +84,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="turn detected boxes into masks with SAM 2",
     )
     parser.add_argument("--segmenter-id", default=None)
+    parser.add_argument(
+        "--zoom-tiles",
+        type=int,
+        default=None,
+        help="also search N x N high-resolution crops for defects (0 = off)",
+    )
+    parser.add_argument(
+        "--defect-segmenter",
+        choices=["none", "sam3"],
+        default=None,
+        help="segment defects with text-prompted SAM 3 instead of boxes",
+    )
+    parser.add_argument(
+        "--sam3-discover",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="add SAM 3 defect detections the VLM missed",
+    )
     return parser
 
 
@@ -119,11 +143,15 @@ def main(argv: list[str] | None = None) -> int:
     from .model import VLM
 
     vlm = VLM(config["model_id"])
-    segmenter = None
+    segmenter = defect_segmenter = None
     if segment:
         from .segmentation import Segmenter
 
         segmenter = Segmenter(config["segmenter_id"])
+    if config["defect_segmenter"] == "sam3" and not config["joint"]:
+        from .segmentation import DefectSegmenter
+
+        defect_segmenter = DefectSegmenter(config["sam3_id"], config["sam3_threshold"])
     results = analyze(
         vlm,
         image_paths,
@@ -135,11 +163,21 @@ def main(argv: list[str] | None = None) -> int:
         thinking=config["thinking"],
         box_coords=config["box_coords"],
         segmenter=segmenter,
+        defect_segmenter=defect_segmenter,
+        discover=config["sam3_discover"],
+        zoom_tiles=config["zoom_tiles"],
+        zoom_overlap=config["zoom_overlap"],
         artifacts_dir=artifacts_dir,
     )
 
     payload = json.dumps(
-        {"model_id": config["model_id"], "prompt": prompt, "results": results},
+        {
+            "model_id": config["model_id"],
+            "prompt": prompt,
+            "config": config,
+            "overview": overview(results),
+            "results": results,
+        },
         indent=2,
         ensure_ascii=False,
     )

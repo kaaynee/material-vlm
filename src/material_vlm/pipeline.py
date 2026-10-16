@@ -9,11 +9,15 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
-from .schema import build_system_prompt, parse_analysis
+from .schema import CONDITIONS, build_system_prompt, build_zoom_prompt, parse_analysis, parse_zoom
 from .segmentation import scale_boxes
 from .visualize import defect_items, draw_overlay, material_items
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+
+ZOOM_INSTRUCTION = "This is a close-up crop of the image. List the defects visible in it."
+# Zoom boxes covering more of the crop than this are not a localization.
+ZOOM_MAX_BOX_FRACTION = 0.6
 
 
 def collect_images(paths: list[str | Path]) -> list[Path]:
@@ -39,7 +43,12 @@ def collect_images(paths: list[str | Path]) -> list[Path]:
 
 def load_image(path: Path, max_side: int | None = None) -> Image.Image:
     image = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    return _downscale(image, max_side)
+
+
+def _downscale(image: Image.Image, max_side: int | None) -> Image.Image:
     if max_side and max(image.size) > max_side:
+        image = image.copy()
         image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
     return image
 
@@ -48,54 +57,240 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "item"
 
 
-def localize(
-    analysis: dict,
-    image_path: Path,
-    input_size: tuple[int, int],
-    box_coords: str,
-    segmenter=None,
-    artifacts_dir: Path | None = None,
-    name: str | None = None,
-) -> dict[str, str]:
-    """Convert boxes to original image pixels, segment them and write artifacts.
+# --- boxes ---------------------------------------------------------------------
 
-    Modifies ``analysis`` in place (boxes, and mask fields when segmenting) and
-    returns the paths of the written overlay images.
+
+def _area(box: list[float]) -> float:
+    return (box[2] - box[0]) * (box[3] - box[1])
+
+
+def _box_overlap(a: list[float], b: list[float]) -> float:
+    """Intersection over the smaller box: 1.0 if one box contains the other."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return 0.0
+    return w * h / min(_area(a), _area(b))
+
+
+def _contains(box: list[float], x: float, y: float) -> bool:
+    return box[0] <= x <= box[2] and box[1] <= y <= box[3]
+
+
+def _box_mask(shape: tuple[int, int], boxes: list[list[float]]) -> np.ndarray:
+    mask = np.zeros(shape, dtype=bool)
+    for x1, y1, x2, y2 in boxes:
+        mask[int(y1) : int(np.ceil(y2)), int(x1) : int(np.ceil(x2))] = True
+    return mask
+
+
+def _mask_at(mask: np.ndarray, x: float, y: float) -> bool:
+    return 0 <= int(y) < mask.shape[0] and 0 <= int(x) < mask.shape[1] and bool(mask[int(y), int(x)])
+
+
+def scale_analysis(analysis: dict, box_coords: str, input_size, image_size) -> None:
+    """Convert all VLM boxes in place to pixel coordinates of the original image."""
+    for m in analysis["materials"]:
+        m["boxes"] = scale_boxes(m["boxes"], box_coords, input_size, image_size)
+        for d in m["defects"]:
+            d["boxes"] = scale_boxes(d["boxes"], box_coords, input_size, image_size)
+            d["source"] = "vlm"
+
+
+# --- zoom pass -------------------------------------------------------------------
+
+
+def tile_grid(size: tuple[int, int], tiles: int, overlap: float) -> list[tuple[int, int, int, int]]:
+    """Split an image into ``tiles`` x ``tiles`` crops that overlap by ``overlap``."""
+    width, height = size
+    tile_w = width / (tiles - (tiles - 1) * overlap)
+    tile_h = height / (tiles - (tiles - 1) * overlap)
+    return [
+        (
+            round(i * tile_w * (1 - overlap)),
+            round(j * tile_h * (1 - overlap)),
+            min(width, round(i * tile_w * (1 - overlap) + tile_w)),
+            min(height, round(j * tile_h * (1 - overlap) + tile_h)),
+        )
+        for j in range(tiles)
+        for i in range(tiles)
+    ]
+
+
+def _find_material(materials: list[dict], name: str, box: list[float]) -> dict | None:
+    """The material the box lies on.
+
+    Among materials whose boxes contain the box center, the named one wins,
+    otherwise the one with the smallest box (e.g. a door rather than the wall
+    around it). Only if no material contains it does the name alone decide.
     """
-    image = load_image(image_path)
-    materials = analysis["materials"]
+    name = name.strip().lower()
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    candidates = [
+        (m["name"].strip().lower() != name, min(_area(b) for b in m["boxes"] if _contains(b, cx, cy)), k)
+        for k, m in enumerate(materials)
+        if any(_contains(b, cx, cy) for b in m["boxes"])
+    ]
+    if candidates:
+        return materials[min(candidates)[2]]
+    return next((m for m in materials if m["name"].strip().lower() == name), None)
 
-    # Every region that gets a mask: materials and the defects within them.
+
+def merge_defect(materials: list[dict], defect: dict, boxes: list[list[float]], source: str) -> bool:
+    """Add a defect found outside the main pass unless it duplicates a known one.
+
+    Boxes overlapping an existing defect of the same type are dropped. Returns
+    whether anything was added (as the last defect of its material).
+    """
+    material = _find_material(materials, defect.get("material", ""), boxes[0])
+    if material is None:
+        return False
+    existing = [
+        b for m in materials for d in m["defects"] if d["type"] == defect["type"] for b in d["boxes"]
+    ]
+    new_boxes = []
+    for box in boxes:
+        if all(_box_overlap(box, b) < 0.5 for b in existing + new_boxes):
+            new_boxes.append(box)
+    if not new_boxes:
+        return False
+    material["defects"].append(
+        {
+            "type": defect["type"],
+            "severity": defect.get("severity", "unknown"),
+            "description": defect.get("description", ""),
+            "boxes": new_boxes,
+            "source": source,
+        }
+    )
+    return True
+
+
+def zoom_pass(vlm, image, analysis, prompt, tiles, overlap, max_side, box_coords, gen) -> list[str]:
+    """Look for defects in overlapping high-resolution crops and merge them in."""
+    materials = analysis["materials"]
+    system_prompt = build_zoom_prompt(box_coords, [m["name"] for m in materials])
+    raw_outputs = []
+    for x0, y0, x1, y1 in tile_grid(image.size, tiles, overlap):
+        crop = _downscale(image.crop((x0, y0, x1, y1)), max_side)
+        raw, input_sizes = vlm.generate(
+            [crop], f"{prompt}\n\n{ZOOM_INSTRUCTION}", system_prompt=system_prompt, **gen
+        )
+        raw_outputs.append(raw)
+        try:
+            defects = parse_zoom(raw).defects
+        except ValueError:
+            continue
+        tile_area = (x1 - x0) * (y1 - y0)
+        for d in defects:
+            boxes = scale_boxes(d.boxes, box_coords, input_sizes[0], (x1 - x0, y1 - y0))
+            boxes = [
+                [bx1 + x0, by1 + y0, bx2 + x0, by2 + y0]
+                for bx1, by1, bx2, by2 in boxes
+                if (bx2 - bx1) * (by2 - by1) <= ZOOM_MAX_BOX_FRACTION * tile_area
+            ]
+            if boxes:
+                merge_defect(materials, d.model_dump(), boxes, source="zoom")
+    return raw_outputs
+
+
+# --- masks and artifacts -----------------------------------------------------------
+
+
+def _regions(materials: list[dict]) -> list[tuple[tuple, dict]]:
     regions = []
     for i, m in enumerate(materials):
-        m["boxes"] = scale_boxes(m["boxes"], box_coords, input_size, image.size)
         regions.append((("material", i), m))
         for j, d in enumerate(m["defects"]):
-            d["boxes"] = scale_boxes(d["boxes"], box_coords, input_size, image.size)
             regions.append((("defect", i, j), d))
+    return regions
 
+
+def segment_regions(
+    materials: list[dict], image: Image.Image, segmenter=None, defect_segmenter=None, discover=False
+) -> dict[tuple, np.ndarray]:
+    """Compute a mask per material and defect, and annotate each with mask fields.
+
+    Defects use SAM 3 instances of their type that lie mostly inside the VLM's
+    boxes; everything else gets box-prompted SAM 2 masks. With ``discover``,
+    SAM 3 instances that match no known defect are added as new defects of the
+    material they lie on.
+    """
+    shape = (image.height, image.width)
     masks: dict[tuple, np.ndarray] = {}
-    if segmenter is not None:
-        all_boxes = [box for _, region in regions for box in region["boxes"]]
-        results = iter(segmenter.segment(image, all_boxes))
-        for key, region in regions:
-            if not region["boxes"]:
-                region.update(mask=None, mask_score=None, area_fraction=0.0)
+    scores: dict[tuple, float] = {}
+    sources: dict[tuple, str] = {}
+
+    detections: dict[str, list[dict]] = {}
+    used: set[tuple[str, int]] = set()
+    if defect_segmenter is not None:
+        from .segmentation import DEFECT_CONCEPTS
+
+        types = {d["type"] for m in materials for d in m["defects"]}
+        if discover:
+            types |= set(DEFECT_CONCEPTS)
+        detections = {t: defect_segmenter.detect(image, t) for t in sorted(types)}
+        for key, region in _regions(materials):
+            if key[0] != "defect" or not region["boxes"]:
                 continue
+            area = _box_mask(shape, region["boxes"])
+            dets = detections.get(region["type"], [])
+            matched = [
+                k for k, det in enumerate(dets)
+                if (det["mask"] & area).sum() >= 0.5 * max(det["mask"].sum(), 1)
+            ]
+            if matched:
+                masks[key] = np.logical_or.reduce([dets[k]["mask"] for k in matched])
+                scores[key] = float(np.mean([dets[k]["score"] for k in matched]))
+                sources[key] = "sam3"
+                used.update((region["type"], k) for k in matched)
+
+    if segmenter is not None:
+        pending = [(key, r) for key, r in _regions(materials) if key not in masks and r["boxes"]]
+        results = iter(segmenter.segment(image, [b for _, r in pending for b in r["boxes"]]))
+        for key, region in pending:
             parts = [next(results) for _ in region["boxes"]]
-            mask = np.logical_or.reduce([m for m, _ in parts])
-            masks[key] = mask
+            masks[key] = np.logical_or.reduce([m for m, _ in parts])
+            scores[key] = float(np.mean([s for _, s in parts]))
+            sources[key] = "sam2"
+
+    if discover:
+        for defect_type, dets in detections.items():
+            for k, det in enumerate(dets):
+                if (defect_type, k) in used:
+                    continue
+                cx = (det["box"][0] + det["box"][2]) / 2
+                cy = (det["box"][1] + det["box"][3]) / 2
+                owner = next(
+                    (
+                        i for i in range(len(materials))
+                        if (("material", i) in masks and _mask_at(masks[("material", i)], cx, cy))
+                        or any(_contains(b, cx, cy) for b in materials[i]["boxes"])
+                    ),
+                    None,
+                )
+                if owner is None:
+                    continue
+                defect = {"type": defect_type, "description": f"found by SAM 3 ('{det['concept']}')"}
+                if merge_defect([materials[owner]], defect, [det["box"]], source="sam3"):
+                    key = ("defect", owner, len(materials[owner]["defects"]) - 1)
+                    masks[key], scores[key], sources[key] = det["mask"], det["score"], "sam3"
+
+    if segmenter is not None or defect_segmenter is not None:
+        for key, region in _regions(materials):
             region.update(
                 mask=None,
-                mask_score=round(float(np.mean([s for _, s in parts])), 3),
-                area_fraction=round(float(mask.mean()), 4),
+                mask_source=sources.get(key),
+                mask_score=round(scores[key], 3) if key in scores else None,
+                area_fraction=round(float(masks[key].mean()), 4) if key in masks else 0.0,
             )
+    return masks
 
-    if artifacts_dir is None:
-        return {}
-    name = name or image_path.stem
+
+def write_artifacts(materials: list[dict], image, masks, artifacts_dir: Path, name: str) -> dict[str, str]:
+    """Save mask PNGs and overlay images; returns the overlay paths."""
     mask_dir = artifacts_dir / "masks" / name
-    for key, region in regions:
+    for key, region in _regions(materials):
         if key not in masks:
             continue
         if key[0] == "material":
@@ -118,6 +313,9 @@ def localize(
     return {kind: str(path) for kind, path in overlays.items()}
 
 
+# --- entry points -------------------------------------------------------------------
+
+
 def analyze(
     vlm,
     image_paths: list[Path],
@@ -129,32 +327,30 @@ def analyze(
     thinking: bool = False,
     box_coords: str = "input_pixels",
     segmenter=None,
+    defect_segmenter=None,
+    discover: bool = False,
+    zoom_tiles: int = 0,
+    zoom_overlap: float = 0.15,
     artifacts_dir: Path | None = None,
 ) -> list[dict]:
     """Run the VLM and return one result record per request.
 
     With ``joint=False`` every image is analyzed on its own; with ``joint=True``
     all images are sent in a single request and one record is returned. Boxes,
-    masks and overlays are only produced per image, since boxes in a joint
-    request cannot be attributed to a specific image.
+    masks, the zoom pass and overlays are only produced per image, since boxes
+    in a joint request cannot be attributed to a specific image.
     """
+    gen = {"max_new_tokens": max_new_tokens, "temperature": temperature, "thinking": thinking}
     system_prompt = build_system_prompt(box_coords)
     groups = [image_paths] if joint else [[p] for p in image_paths]
     results = []
     for index, group in enumerate(groups):
         images = [load_image(p, max_image_side) for p in group]
         start = time.perf_counter()
-        raw, input_sizes = vlm.generate(
-            images,
-            prompt,
-            system_prompt=system_prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            thinking=thinking,
-        )
+        raw, input_sizes = vlm.generate(images, prompt, system_prompt=system_prompt, **gen)
         record = {
             "images": [str(p) for p in group],
-            "vlm_seconds": round(time.perf_counter() - start, 2),
+            "vlm_seconds": None,
             "analysis": None,
             "overlays": {},
             "parse_error": None,
@@ -164,6 +360,7 @@ def analyze(
             analysis = parse_analysis(raw).model_dump()
         except ValueError as exc:  # includes pydantic.ValidationError
             record["parse_error"] = str(exc)
+            record["vlm_seconds"] = round(time.perf_counter() - start, 2)
             results.append(record)
             continue
 
@@ -173,15 +370,46 @@ def analyze(
                 for d in m["defects"]:
                     d["boxes"] = []
         else:
-            record["overlays"] = localize(
-                analysis,
-                group[0],
-                input_sizes[0],
-                box_coords,
-                segmenter=segmenter,
-                artifacts_dir=artifacts_dir,
-                name=f"{index:04d}_{group[0].stem}",
+            original = load_image(group[0])
+            scale_analysis(analysis, box_coords, input_sizes[0], original.size)
+            if zoom_tiles > 1 and analysis["materials"]:
+                record["zoom_raw_outputs"] = zoom_pass(
+                    vlm, original, analysis, prompt, zoom_tiles, zoom_overlap,
+                    max_image_side, box_coords, gen,
+                )
+        record["vlm_seconds"] = round(time.perf_counter() - start, 2)
+        if not joint:
+            masks = segment_regions(
+                analysis["materials"], original, segmenter, defect_segmenter, discover
             )
+            if artifacts_dir is not None:
+                record["overlays"] = write_artifacts(
+                    analysis["materials"], original, masks, artifacts_dir,
+                    f"{index:04d}_{group[0].stem}",
+                )
         record["analysis"] = analysis
         results.append(record)
     return results
+
+
+def overview(results: list[dict]) -> list[dict]:
+    """Aggregate materials across images (e.g. frames of one video) by name."""
+    rank = {"unknown": 0, "good": 1, "fair": 2, "poor": 3}
+    by_name: dict[str, dict] = {}
+    for record in results:
+        if record["analysis"] is None:
+            continue
+        for m in record["analysis"]["materials"]:
+            name = m["name"].strip().lower()
+            entry = by_name.setdefault(
+                name,
+                {"name": name, "images": 0, "conditions": dict.fromkeys(CONDITIONS, 0), "defects": {}},
+            )
+            entry["images"] += 1
+            entry["conditions"][m["condition"]] += 1
+            for d in m["defects"]:
+                entry["defects"][d["type"]] = entry["defects"].get(d["type"], 0) + 1
+    for entry in by_name.values():
+        seen = [c for c, n in entry["conditions"].items() if n]
+        entry["worst_condition"] = max(seen, key=rank.__getitem__)
+    return sorted(by_name.values(), key=lambda e: -e["images"])

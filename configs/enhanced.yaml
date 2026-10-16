@@ -1,0 +1,20 @@
+# Quick-win settings. Layer last, after the model config:
+#   --config configs/models/<model>.yaml --config configs/enhanced.yaml
+# Each image then takes roughly 1 + zoom_tiles^2 VLM calls instead of one.
+
+# Prompt with definitions for the condition scale and each defect type.
+prompt_file: prompts/enhanced.txt
+
+# Higher resolution for the full-image pass.
+max_image_side: 1792
+
+# Search 2 x 2 overlapping crops at full resolution for small defects.
+zoom_tiles: 2
+zoom_overlap: 0.15
+
+# Text-prompted SAM 3 masks for cracks, rust and biological growth, plus
+# detections the VLM missed. facebook/sam3 is gated: request access on
+# Hugging Face and log in on Euler first (see README).
+defect_segmenter: sam3
+sam3_discover: true
+sam3_threshold: 0.4

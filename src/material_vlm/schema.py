@@ -58,8 +58,35 @@ the material, and one box per affected area for each defect.
 Use an empty list for "defects" if none are visible and an empty list for "materials" if no material can be identified."""
 
 
+ZOOM_PROMPT_TEMPLATE = """You are an expert in material condition assessment, inspecting a close-up crop
+of a larger image for defects. Materials identified in the full image: {materials}.
+Answer with a single JSON object and nothing else, using exactly this structure:
+
+{{
+  "defects": [
+    {{
+      "material": "<the affected material, one of the materials listed above>",
+      "type": "<one of: crack, corrosion, biological_decay, other>",
+      "severity": "<one of: low, medium, high>",
+      "description": "<what is visible>",
+      "boxes": [[x1, y1, x2, y2], ...]
+    }}
+  ]
+}}
+
+"boxes" are tight bounding boxes in {box_instruction} of this crop, one per affected area.
+Report only clearly visible defects and use an empty list if there are none."""
+
+
 def build_system_prompt(box_coords: str = "input_pixels") -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(box_instruction=BOX_INSTRUCTIONS[box_coords])
+
+
+def build_zoom_prompt(box_coords: str, materials: list[str]) -> str:
+    return ZOOM_PROMPT_TEMPLATE.format(
+        box_instruction=BOX_INSTRUCTIONS[box_coords],
+        materials=", ".join(f'"{m}"' for m in materials),
+    )
 
 
 def _clean_boxes(value) -> list[list[float]]:
@@ -111,6 +138,14 @@ class Defect(BaseModel):
     @classmethod
     def _boxes(cls, value):
         return _clean_boxes(value)
+
+
+class ZoomDefect(Defect):
+    material: str = ""
+
+
+class ZoomAnalysis(BaseModel):
+    defects: list[ZoomDefect] = Field(default_factory=list)
 
 
 class Material(BaseModel):
@@ -178,3 +213,7 @@ def extract_json(text: str) -> dict:
 
 def parse_analysis(text: str) -> MaterialAnalysis:
     return MaterialAnalysis.model_validate(extract_json(text))
+
+
+def parse_zoom(text: str) -> ZoomAnalysis:
+    return ZoomAnalysis.model_validate(extract_json(text))

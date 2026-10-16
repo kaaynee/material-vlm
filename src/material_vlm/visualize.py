@@ -88,7 +88,8 @@ def defect_items(materials: list[dict], masks: dict) -> list[dict]:
                     "boxes": d["boxes"],
                     "mask": masks.get(("defect", i, j)),
                     "color": DEFECT_COLORS[d["type"]],
-                    "label": f"{d['type']} | {d['severity']} ({m['name']})",
+                    "label": f"{d['type']} | {d['severity']} ({m['name']})"
+                    + (f" [{d['source']}]" if d.get("source", "vlm") != "vlm" else ""),
                 }
             )
     return items
