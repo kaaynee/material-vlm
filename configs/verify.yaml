@@ -1,0 +1,16 @@
+# Verification (design A): after segmentation, every defect candidate from the
+# VLM, the zoom pass and SAM 3 is shown to the VLM again as a close-up crop,
+# plain and with the region outlined, and classified blind as a defect type or
+# a look-alike (mortar joint, edge, shadow, stain, nothing). Look-alikes are
+# removed from the result and listed under "rejected_defects".
+# Layer it last, e.g. on top of the quick wins:
+#   --config configs/models/<model>.yaml --config configs/enhanced.yaml --config configs/verify.yaml
+# Adds one short VLM call per defect candidate.
+verify: true
+
+# Context around a region, as a fraction of its size on each side.
+verify_padding: 0.5
+# Longer side of the crops shown to the VLM.
+verify_max_side: 1024
+# Candidates beyond this are kept unverified.
+verify_max_per_image: 40

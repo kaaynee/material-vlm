@@ -5,6 +5,7 @@
 #   bash scripts/euler/compare.sh data/frames/site site            # small set
 #   bash scripts/euler/compare.sh data/frames/site site large      # largest models per family
 #   bash scripts/euler/compare.sh data/frames/site site "qwen3-vl-32b qwen3.5-27b"
+#   TIME_LIMIT=12:00:00 bash scripts/euler/compare.sh ...       # override time limits
 #
 # Results land in outputs/<name>/<model>.json; afterwards compare them with
 #   material-vlm-compare outputs/<name>/*.json --out outputs/<name>/comparison
@@ -59,6 +60,7 @@ for model in $models; do
         exit 1
     fi
     read -r gpus gpumem time_limit <<< "$(resources "$model")"
+    time_limit=${TIME_LIMIT:-$time_limit}
     echo "Submitting $model ($gpus GPU x $gpumem, $time_limit)"
     sbatch --job-name="mvlm-$model" --gpus="$gpus" --gres="gpumem:$gpumem" \
         --time="$time_limit" --mem-per-cpu=16G \

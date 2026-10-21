@@ -167,6 +167,38 @@ The output JSON also contains an `overview`: every material seen across the
 images, in how many images it appeared, its condition counts, worst condition
 and defect counts. This is useful for frames of a video.
 
+### Verification of defect candidates
+
+`configs/verify.yaml` adds a verification step after segmentation. Every defect
+candidate, whether it comes from the VLM, the zoom pass or SAM 3, is shown to the
+VLM again as a close-up crop. The model gets two images, the plain crop and the
+same crop with the region outlined, and classifies the region without being told
+the original guess. The answer is either a defect type (`crack`, `corrosion`,
+`biological_decay`, `other_defect`) or a look-alike (`joint_or_edge`,
+`surface_mark` for shadow, dirt, stains or paint, or `nothing`).
+
+- **Accepted:** the candidate stays, with the verifier's type and severity.
+- **Rejected:** a look-alike is moved to `rejected_defects` and drawn in gray in
+  the `*_rejected.jpg` overlay.
+- **Unverified:** a candidate without boxes, beyond `verify_max_per_image`, or
+  with an unusable answer is kept with `verified: null`.
+
+Layer it last. To measure its effect, run it next to the same settings without
+it, on the same images:
+
+```bash
+bash scripts/euler/compare.sh data/frames/site site_enhanced large --config configs/enhanced.yaml
+bash scripts/euler/compare.sh data/frames/site site_verified large \
+    --config configs/enhanced.yaml --config configs/verify.yaml
+material-vlm-compare outputs/site_enhanced/qwen3-vl-32b.json outputs/site_verified/qwen3-vl-32b.json \
+    --out outputs/site_verified/vs_enhanced
+```
+
+The comparison adds a row with the rejected defects, and `summary.json` counts
+rejections as `<original type>-><label>`. Verification adds one short VLM call
+per candidate (typically 5-30 per image with the enhanced settings), so raise
+time limits with `TIME_LIMIT=12:00:00 bash scripts/euler/compare.sh ...`.
+
 ### Options
 
 | Option | Meaning |
@@ -186,6 +218,7 @@ and defect counts. This is useful for frames of a video.
 | `--zoom-tiles N` | also search N x N crops for defects (0 = off) |
 | `--defect-segmenter sam3` | text-prompted SAM 3 defect masks |
 | `--sam3-discover` | add SAM 3 detections the VLM missed |
+| `--verify` | check every defect candidate on a close-up crop and drop look-alikes |
 
 ## Output
 
@@ -253,6 +286,10 @@ looks like this (one entry in `results` per image):
 - `boxes`: `[x1, y1, x2, y2]` in pixels of the original image.
 - `mask_score`: SAM 2's predicted mask quality (0-1); `area_fraction`: share
   of the image covered by the mask.
+- With verification, each defect has `verified` (`true`, or `null` if it was not
+  checked) and `verification` (`label`, `severity`, `reason`, `original_type`).
+  Each result then also has `rejected_defects`, `verify_seconds`,
+  `verification_raw_outputs` and a `rejected` overlay.
 
 If the model output cannot be parsed, `analysis` is `null`, `parse_error`
 explains why and `raw_output` still holds the model's text.

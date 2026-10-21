@@ -9,15 +9,28 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
-from .schema import CONDITIONS, build_system_prompt, build_zoom_prompt, parse_analysis, parse_zoom
+from .schema import (
+    CONDITIONS,
+    VERIFY_DEFECT_TYPES,
+    VERIFY_INSTRUCTION,
+    build_system_prompt,
+    build_verify_prompt,
+    build_zoom_prompt,
+    parse_analysis,
+    parse_verification,
+    parse_zoom,
+)
 from .segmentation import scale_boxes
-from .visualize import defect_items, draw_overlay, material_items
+from .visualize import defect_items, draw_overlay, material_items, outline_region, rejected_items
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
 ZOOM_INSTRUCTION = "This is a close-up crop of the image. List the defects visible in it."
 # Zoom boxes covering more of the crop than this are not a localization.
 ZOOM_MAX_BOX_FRACTION = 0.6
+# Verification crops are at least this fraction of the image's longer side, so
+# small defects are shown with enough surrounding context.
+VERIFY_MIN_CROP_FRACTION = 0.15
 
 
 def collect_images(paths: list[str | Path]) -> list[Path]:
@@ -194,6 +207,99 @@ def zoom_pass(vlm, image, analysis, prompt, tiles, overlap, max_side, box_coords
     return raw_outputs
 
 
+# --- verification ----------------------------------------------------------------
+
+
+def verification_views(
+    image: Image.Image, mask: np.ndarray | None, boxes: list[list[float]], padding: float, max_side: int | None
+) -> tuple[Image.Image, Image.Image]:
+    """A padded crop around a region, plain and with the region outlined."""
+    if mask is not None and mask.any():
+        ys, xs = np.nonzero(mask)
+        x1, y1, x2, y2 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
+    else:
+        x1, y1 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+        x2, y2 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+    # Padded per axis, so a long thin region (a crack, a joint) does not pull in
+    # unrelated surface that could distract the model.
+    min_side = VERIFY_MIN_CROP_FRACTION * max(image.size)
+    crop_w = max((x2 - x1) * (1 + 2 * padding), min_side)
+    crop_h = max((y2 - y1) * (1 + 2 * padding), min_side)
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    left, top = max(0, round(cx - crop_w / 2)), max(0, round(cy - crop_h / 2))
+    right, bottom = min(image.width, round(cx + crop_w / 2)), min(image.height, round(cy + crop_h / 2))
+
+    crop = image.crop((left, top, right, bottom))
+    crop_mask = mask[top:bottom, left:right] if mask is not None else None
+    crop_boxes = [[bx1 - left, by1 - top, bx2 - left, by2 - top] for bx1, by1, bx2, by2 in boxes]
+    marked = outline_region(crop, crop_mask, crop_boxes)
+    return _downscale(crop, max_side), _downscale(marked, max_side)
+
+
+def verify_defects(vlm, image, materials, masks, padding, max_side, limit, gen) -> list[str]:
+    """Ask the VLM what each defect candidate actually shows.
+
+    Every defect gets a ``verification`` entry (None if it was not checked: no
+    boxes, over the per-image limit or an unparseable answer). Returns the raw
+    model outputs.
+    """
+    raw_outputs = []
+    checked = 0
+    for i, m in enumerate(materials):
+        system_prompt = build_verify_prompt(m["name"])
+        for j, d in enumerate(m["defects"]):
+            d["verification"] = None
+            if not d["boxes"] or checked >= limit:
+                continue
+            checked += 1
+            views = verification_views(image, masks.get(("defect", i, j)), d["boxes"], padding, max_side)
+            raw, _ = vlm.generate(list(views), VERIFY_INSTRUCTION, system_prompt=system_prompt, **gen)
+            raw_outputs.append(raw)
+            try:
+                answer = parse_verification(raw)
+            except ValueError:
+                continue
+            d["verification"] = {**answer.model_dump(), "original_type": d["type"]}
+    return raw_outputs
+
+
+def apply_verification(materials: list[dict], masks: dict) -> tuple[dict, list[dict]]:
+    """Drop rejected defects and relabel accepted ones.
+
+    A defect is accepted if the verifier named a defect type (which replaces the
+    original type, along with its severity), rejected if it named a look-alike
+    and kept unverified otherwise. Returns the masks re-keyed to the remaining
+    defects, with rejected ones under ``("rejected", k)``, and the rejected
+    defects with their material name.
+    """
+    new_masks = {key: mask for key, mask in masks.items() if key[0] == "material"}
+    rejected = []
+    for i, m in enumerate(materials):
+        kept = []
+        for j, d in enumerate(m["defects"]):
+            mask = masks.get(("defect", i, j))
+            v = d.get("verification")
+            label = v["label"] if v else "unclear"
+            if label in VERIFY_DEFECT_TYPES:
+                d["verified"] = True
+                d["type"] = VERIFY_DEFECT_TYPES[label]
+                if v["severity"] != "unknown":
+                    d["severity"] = v["severity"]
+            elif label == "unclear":
+                d["verified"] = None
+            else:
+                d["verified"] = False
+                if mask is not None:
+                    new_masks[("rejected", len(rejected))] = mask
+                rejected.append({**d, "material": m["name"]})
+                continue
+            if mask is not None:
+                new_masks[("defect", i, len(kept))] = mask
+            kept.append(d)
+        m["defects"] = kept
+    return new_masks, rejected
+
+
 # --- masks and artifacts -----------------------------------------------------------
 
 
@@ -287,8 +393,11 @@ def segment_regions(
     return masks
 
 
-def write_artifacts(materials: list[dict], image, masks, artifacts_dir: Path, name: str) -> dict[str, str]:
-    """Save mask PNGs and overlay images; returns the overlay paths."""
+def write_artifacts(
+    materials: list[dict], image, masks, artifacts_dir: Path, name: str, rejected: list[dict] | None = None
+) -> dict[str, str]:
+    """Save mask PNGs and overlay images; returns the overlay paths. With
+    ``rejected`` (verification ran), an overlay of the rejected defects is added."""
     mask_dir = artifacts_dir / "masks" / name
     for key, region in _regions(materials):
         if key not in masks:
@@ -310,6 +419,9 @@ def write_artifacts(materials: list[dict], image, masks, artifacts_dir: Path, na
     }
     draw_overlay(image, material_items(materials, masks)).save(overlays["materials"], quality=90)
     draw_overlay(image, defect_items(materials, masks)).save(overlays["defects"], quality=90)
+    if rejected is not None:
+        overlays["rejected"] = overlay_dir / f"{name}_rejected.jpg"
+        draw_overlay(image, rejected_items(rejected, masks)).save(overlays["rejected"], quality=90)
     return {kind: str(path) for kind, path in overlays.items()}
 
 
@@ -331,14 +443,20 @@ def analyze(
     discover: bool = False,
     zoom_tiles: int = 0,
     zoom_overlap: float = 0.15,
+    verify: bool = False,
+    verify_padding: float = 0.5,
+    verify_max_side: int | None = 1024,
+    verify_max_per_image: int = 40,
     artifacts_dir: Path | None = None,
 ) -> list[dict]:
     """Run the VLM and return one result record per request.
 
     With ``joint=False`` every image is analyzed on its own; with ``joint=True``
     all images are sent in a single request and one record is returned. Boxes,
-    masks, the zoom pass and overlays are only produced per image, since boxes
-    in a joint request cannot be attributed to a specific image.
+    masks, the zoom pass, verification and overlays are only produced per
+    image, since boxes in a joint request cannot be attributed to a specific
+    image. Verification runs after segmentation, so it checks the candidates of
+    the VLM, the zoom pass and SAM 3 alike.
     """
     gen = {"max_new_tokens": max_new_tokens, "temperature": temperature, "thinking": thinking}
     system_prompt = build_system_prompt(box_coords)
@@ -382,10 +500,21 @@ def analyze(
             masks = segment_regions(
                 analysis["materials"], original, segmenter, defect_segmenter, discover
             )
+            rejected = None
+            if verify:
+                start = time.perf_counter()
+                verify_gen = gen if thinking else {**gen, "max_new_tokens": min(max_new_tokens, 512)}
+                record["verification_raw_outputs"] = verify_defects(
+                    vlm, original, analysis["materials"], masks, verify_padding,
+                    verify_max_side, verify_max_per_image, verify_gen,
+                )
+                masks, rejected = apply_verification(analysis["materials"], masks)
+                record["rejected_defects"] = rejected
+                record["verify_seconds"] = round(time.perf_counter() - start, 2)
             if artifacts_dir is not None:
                 record["overlays"] = write_artifacts(
                     analysis["materials"], original, masks, artifacts_dir,
-                    f"{index:04d}_{group[0].stem}",
+                    f"{index:04d}_{group[0].stem}", rejected,
                 )
         record["analysis"] = analysis
         results.append(record)

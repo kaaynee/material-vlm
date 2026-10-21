@@ -325,3 +325,129 @@ def test_find_material_prefers_position_over_name():
     assert _find_material(materials, "brick wall", [250, 50, 260, 60]) is plate  # position beats name
     assert _find_material(materials, "steel door", [500, 50, 510, 60]) is door   # name as fallback
     assert _find_material(materials, "glass", [500, 50, 510, 60]) is None
+
+
+# --- verification (design A) ------------------------------------------------
+
+from material_vlm.pipeline import verification_views  # noqa: E402
+from material_vlm.schema import parse_verification  # noqa: E402
+
+THREE_DEFECTS = {
+    "summary": "wall",
+    "materials": [
+        {"name": "brick", "boxes": [[0, 0, 200, 100]], "condition": "poor", "defects": [
+            {"type": "crack", "severity": "low", "boxes": [[10, 10, 20, 50]]},
+            {"type": "crack", "severity": "high", "boxes": [[100, 40, 160, 45]]},
+            {"type": "moss", "severity": "low", "boxes": [[150, 60, 190, 90]]},
+            "spalling somewhere",  # no boxes: cannot be checked
+        ]},
+    ],
+}
+
+
+class VerifyVLM(FakeVLM):
+    """Answers the main pass with ``answer`` and the n-th verification with ``verdicts[n]``."""
+
+    def __init__(self, answer, verdicts):
+        super().__init__(answer)
+        self.verdicts = list(verdicts)
+        self.verify_images = []
+
+    def generate(self, images, prompt, system_prompt="", **kwargs):
+        self.calls.append(len(images))
+        if "candidate defects" in system_prompt:
+            self.verify_images.append(images)
+            return self.verdicts.pop(0), [im.size for im in images]
+        return self.answer, [im.size for im in images]
+
+
+def test_parse_verification_normalizes_free_text():
+    assert parse_verification('{"label": "Mortar joint", "severity": "LOW"}').label == "joint_or_edge"
+    assert parse_verification('{"label": "biological decay"}').label == "biological_decay"
+    assert parse_verification('{"label": "shadow"}').label == "surface_mark"
+    assert parse_verification('{"label": "rust"}').label == "corrosion"
+    assert parse_verification('{"label": "???", "severity": "big"}').model_dump() == {
+        "label": "unclear", "severity": "unknown", "reason": ""
+    }
+
+
+def test_verification_views_pad_and_outline():
+    image = Image.new("RGB", (400, 200), "gray")
+    mask = np.zeros((200, 400), dtype=bool)
+    mask[90:110, 190:210] = True
+    plain, marked = verification_views(image, mask, [[180, 80, 220, 120]], 0.5, None)
+    # 20 px region padded to 40 px, but at least 15% of 400 px = 60 px
+    assert plain.size == marked.size == (60, 60)
+    marked = np.array(marked)
+    assert (marked == (255, 0, 255)).all(axis=-1).any()   # outline drawn
+    assert (marked[30, 30] == 128).all()                  # region itself not covered
+    # without a mask the boxes are outlined; crops are clipped at the border
+    plain, _ = verification_views(image, None, [[0, 0, 100, 40]], 0.5, 64)
+    assert max(plain.size) == 64
+
+
+def test_verification_drops_look_alikes_and_relabels(tmp_path):
+    path = tmp_path / "wall.png"
+    Image.new("RGB", (200, 100)).save(path)
+    verdicts = [
+        json.dumps({"label": "crack", "severity": "medium", "reason": "irregular fracture"}),
+        json.dumps({"label": "joint_or_edge", "severity": "low", "reason": "straight mortar joint"}),
+        json.dumps({"label": "surface_mark", "reason": "green paint"}),
+    ]
+    vlm = VerifyVLM(json.dumps(THREE_DEFECTS), verdicts)
+    record = analyze(vlm, [path], "prompt", segmenter=FakeSegmenter(), verify=True,
+                     artifacts_dir=tmp_path / "run")[0]
+
+    assert vlm.calls == [1, 2, 2, 2]  # main pass, then plain + outlined crop per candidate
+    brick = record["analysis"]["materials"][0]
+    crack, unchecked = brick["defects"]
+    assert (crack["type"], crack["severity"], crack["verified"]) == ("crack", "medium", True)
+    assert crack["mask"].endswith("defect_00_00_crack.png")
+    assert unchecked["verified"] is None and unchecked["verification"] is None
+
+    rejected = record["rejected_defects"]
+    assert [(d["type"], d["verification"]["label"], d["material"]) for d in rejected] == [
+        ("crack", "joint_or_edge", "brick"), ("biological_decay", "surface_mark", "brick")]
+    assert all(d["verified"] is False for d in rejected)
+    assert set(record["overlays"]) == {"materials", "defects", "rejected"}
+    assert len(record["verification_raw_outputs"]) == 3 and "verify_seconds" in record
+
+
+def test_verification_relabels_type_and_respects_limit(tmp_path):
+    path = tmp_path / "wall.png"
+    Image.new("RGB", (200, 100)).save(path)
+    vlm = VerifyVLM(json.dumps(THREE_DEFECTS), [json.dumps({"label": "rust", "severity": "high"})])
+    record = analyze(vlm, [path], "prompt", verify=True, verify_max_per_image=1)[0]
+    defects = record["analysis"]["materials"][0]["defects"]
+    assert [(d["type"], d["verified"]) for d in defects] == [
+        ("corrosion", True), ("crack", None), ("biological_decay", None), ("other", None)]
+    assert defects[0]["verification"]["original_type"] == "crack"
+    assert record["rejected_defects"] == []
+
+
+def test_compare_shows_rejections(tmp_path):
+    from material_vlm.compare import main as compare_main
+
+    path = tmp_path / "wall.png"
+    Image.new("RGB", (200, 100)).save(path)
+    verdicts = [json.dumps({"label": "crack"}), json.dumps({"label": "joint"}),
+                json.dumps({"label": "nothing"})]
+    runs = {
+        "base": analyze(FakeVLM(json.dumps(THREE_DEFECTS), (200, 100)), [path], "prompt",
+                        segmenter=FakeSegmenter(), artifacts_dir=tmp_path / "base"),
+        "verified": analyze(VerifyVLM(json.dumps(THREE_DEFECTS), verdicts), [path], "prompt",
+                            segmenter=FakeSegmenter(), verify=True, artifacts_dir=tmp_path / "verified"),
+    }
+    for name, results in runs.items():
+        (tmp_path / f"{name}.json").write_text(json.dumps({"model_id": "m", "results": results}))
+    out = tmp_path / "comparison"
+    compare_main([str(tmp_path / "base.json"), str(tmp_path / "verified.json"), "--out", str(out)])
+
+    base, verified = json.loads((out / "summary.json").read_text())
+    assert base["rejected"] is None
+    assert base["defects"] == {"crack": 2, "biological_decay": 1, "other": 1}
+    assert verified["defects"] == {"crack": 1, "other": 1}
+    assert verified["rejected"] == {"crack->joint_or_edge": 1, "biological_decay->nothing": 1}
+    # rows: materials and defects (200x100 overlays scaled to 640 wide, plus a
+    # 36 px header), then rejected, as tall as the 640x480 "not verified" tile
+    assert Image.open(out / "0000_wall.jpg").height == 2 * (320 + 36) + (480 + 36)

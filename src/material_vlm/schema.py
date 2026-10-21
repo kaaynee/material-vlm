@@ -78,6 +78,52 @@ Answer with a single JSON object and nothing else, using exactly this structure:
 Report only clearly visible defects and use an empty list if there are none."""
 
 
+# Answers of the verification step: the defect types plus look-alikes that are
+# not defects. "unclear" is used when the answer cannot be mapped.
+VERIFY_LABELS = (
+    "crack", "corrosion", "biological_decay", "other_defect",
+    "joint_or_edge", "surface_mark", "nothing", "unclear",
+)
+VERIFY_DEFECT_TYPES = {
+    "crack": "crack",
+    "corrosion": "corrosion",
+    "biological_decay": "biological_decay",
+    "other_defect": "other",
+}
+VERIFY_REJECT_KEYWORDS = {
+    "joint_or_edge": ("joint", "seam", "edge", "boundary", "gap between"),
+    "surface_mark": ("shadow", "stain", "dirt", "paint", "graffiti", "reflection", "mark"),
+    "nothing": ("nothing", "none", "no defect", "intact"),
+}
+
+# The candidate's predicted type is deliberately not shown, so the model
+# classifies what it sees instead of confirming a suggestion.
+VERIFY_PROMPT_TEMPLATE = """You are an expert in material condition assessment, checking candidate defects
+found by an automated system on a surface of {material}.
+You get two images: the first is a close-up crop, the second is the same crop with
+the candidate region outlined in magenta. Look at the first image to see the surface
+without the outline and decide what the outlined region actually shows. Judge only
+what is inside the outline: the crop may contain other defects around it, ignore them.
+
+Choose exactly one label:
+- "crack": a fracture through the material itself, usually irregular and of varying width
+- "corrosion": rust or oxidation of metal, including rust staining from metal
+- "biological_decay": moss, algae, lichen, mold, fungi, rot or plants growing on the surface
+- "other_defect": another real defect, e.g. spalling, efflorescence, missing or eroded material
+- "joint_or_edge": a mortar joint, a designed seam or gap, an edge or a boundary between materials
+- "surface_mark": a shadow, dirt, a stain, paint, graffiti, a reflection or wetness without damage
+- "nothing": nothing out of the ordinary in the outlined region
+
+Answer with a single JSON object and nothing else:
+{{"label": "<one of the labels above>", "severity": "<low, medium or high; low if not a defect>", "reason": "<the visual cues you used>"}}"""
+
+VERIFY_INSTRUCTION = "What does the outlined region show?"
+
+
+def build_verify_prompt(material: str) -> str:
+    return VERIFY_PROMPT_TEMPLATE.format(material=material)
+
+
 def build_system_prompt(box_coords: str = "input_pixels") -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(box_instruction=BOX_INSTRUCTIONS[box_coords])
 
@@ -185,6 +231,37 @@ class Material(BaseModel):
         return [{"type": d, "description": d} if isinstance(d, str) else d for d in value]
 
 
+def normalize_verify_label(value) -> str:
+    value = str(value).strip().lower().replace(" ", "_")
+    if value in VERIFY_LABELS:
+        return value
+    text = value.replace("_", " ")
+    for label, keywords in VERIFY_REJECT_KEYWORDS.items():
+        if any(k in text for k in keywords):
+            return label
+    for defect_type, keywords in DEFECT_KEYWORDS.items():
+        if any(k in text for k in keywords):
+            return defect_type
+    return "other_defect" if "other" in text else "unclear"
+
+
+class Verification(BaseModel):
+    label: Literal[VERIFY_LABELS] = "unclear"
+    severity: Literal["low", "medium", "high", "unknown"] = "unknown"
+    reason: str = ""
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def _normalize_label(cls, value):
+        return normalize_verify_label(value)
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _normalize_severity(cls, value):
+        value = str(value).strip().lower()
+        return value if value in SEVERITIES else "unknown"
+
+
 class MaterialAnalysis(BaseModel):
     summary: str = ""
     materials: list[Material] = Field(default_factory=list)
@@ -217,3 +294,7 @@ def parse_analysis(text: str) -> MaterialAnalysis:
 
 def parse_zoom(text: str) -> ZoomAnalysis:
     return ZoomAnalysis.model_validate(extract_json(text))
+
+
+def parse_verification(text: str) -> Verification:
+    return Verification.model_validate(extract_json(text))

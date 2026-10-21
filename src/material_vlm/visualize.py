@@ -16,6 +16,8 @@ DEFECT_COLORS = {
     "biological_decay": (60, 180, 75),
     "other": (255, 225, 25),
 }
+REJECTED_COLOR = (128, 128, 128)
+OUTLINE_COLOR = (255, 0, 255)
 CONDITION_COLORS = {
     "good": (60, 180, 75),
     "fair": (255, 190, 0),
@@ -93,3 +95,39 @@ def defect_items(materials: list[dict], masks: dict) -> list[dict]:
                 }
             )
     return items
+
+
+def rejected_items(rejected: list[dict], masks: dict) -> list[dict]:
+    """Overlay items for defects the verification rejected, in gray."""
+    return [
+        {
+            "boxes": d["boxes"],
+            "mask": masks.get(("rejected", k)),
+            "color": REJECTED_COLOR,
+            "label": f"{d['type']} -> {d['verification']['label']} ({d['material']})",
+        }
+        for k, d in enumerate(rejected)
+    ]
+
+
+def outline_region(crop: Image.Image, mask: np.ndarray | None, boxes: list[list[float]]) -> Image.Image:
+    """Outline a region on a copy of the crop without covering the region itself.
+
+    The mask is dilated before its contour is drawn, so thin regions such as
+    cracks stay visible inside the outline. Without a mask the boxes are drawn.
+    """
+    import cv2
+
+    marked = np.array(crop.convert("RGB"))
+    width = max(2, round(max(crop.size) / 200))
+    if mask is not None and mask.any():
+        kernel = np.ones((2 * width + 1, 2 * width + 1), np.uint8)
+        dilated = cv2.dilate(mask.astype(np.uint8), kernel, iterations=2)
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(marked, contours, -1, OUTLINE_COLOR, width)
+        return Image.fromarray(marked)
+    image = Image.fromarray(marked)
+    draw = ImageDraw.Draw(image)
+    for x1, y1, x2, y2 in boxes:
+        draw.rectangle((x1 - width, y1 - width, x2 + width, y2 + width), outline=OUTLINE_COLOR, width=width)
+    return image

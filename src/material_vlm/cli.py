@@ -28,6 +28,10 @@ DEFAULTS = {
     "sam3_id": "facebook/sam3",
     "sam3_threshold": 0.4,
     "sam3_discover": False,
+    "verify": False,
+    "verify_padding": 0.5,
+    "verify_max_side": 1024,
+    "verify_max_per_image": 40,
 }
 
 
@@ -102,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="add SAM 3 defect detections the VLM missed",
     )
+    parser.add_argument(
+        "--verify",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="check every defect candidate on a close-up crop and drop look-alikes",
+    )
     return parser
 
 
@@ -167,6 +177,10 @@ def main(argv: list[str] | None = None) -> int:
         discover=config["sam3_discover"],
         zoom_tiles=config["zoom_tiles"],
         zoom_overlap=config["zoom_overlap"],
+        verify=config["verify"],
+        verify_padding=config["verify_padding"],
+        verify_max_side=config["verify_max_side"],
+        verify_max_per_image=config["verify_max_per_image"],
         artifacts_dir=artifacts_dir,
     )
 
@@ -191,6 +205,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(payload)
 
+    if config["verify"] and not config["joint"]:
+        kept = sum(len(m["defects"]) for r in results if r["analysis"] for m in r["analysis"]["materials"])
+        rejected = sum(len(r.get("rejected_defects", [])) for r in results)
+        print(f"Verification kept {kept} and rejected {rejected} defect(s)", file=sys.stderr)
     failed = sum(r["analysis"] is None for r in results)
     if failed:
         print(f"{failed}/{len(results)} output(s) could not be parsed as JSON", file=sys.stderr)
